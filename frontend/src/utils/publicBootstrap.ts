@@ -1,6 +1,6 @@
 import type { LiveDataResponse } from '../contexts/LiveDataContext';
 import { normalizeLiveDataResponse } from './liveDataResponse.ts';
-import { normalizePublicClients } from './publicClients.ts';
+import { normalizePublicClient, normalizePublicClients, sortPublicClients } from './publicClients.ts';
 import { normalizePublicSettings, type PublicSettings } from './publicSettings.ts';
 import { fetchWithBootstrapRetry } from './api.ts';
 import type { ClientInfo } from '../types';
@@ -25,8 +25,9 @@ const PUBLIC_BOOTSTRAP_STORAGE_MAX_AGE_MS = 10 * 60_000;
 const PUBLIC_BOOTSTRAP_CLIENT_PATCH_MAX_AGE_MS = 10 * 60_000;
 
 type PublicBootstrapClientPatch = {
+  version: 2;
   saved_at: number;
-  upsert: ClientInfo[];
+  upsert: Array<Partial<ClientInfo> & { uuid: string }>;
   remove: string[];
 };
 
@@ -43,13 +44,13 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function normalizePublicBootstrap(payload: unknown): PublicBootstrapPayload {
+function normalizePublicBootstrap(payload: unknown, options: { includeHidden?: boolean } = {}): PublicBootstrapPayload {
   const record = asRecord(payload);
   if (!record) throw new Error('Invalid public bootstrap response');
   return applyStoredClientPatch({
     settings: record.settings === undefined ? undefined : normalizePublicSettings(record.settings) || undefined,
-    clients: record.clients === undefined ? undefined : normalizePublicClients(record.clients),
-    nodes: record.nodes === undefined ? undefined : normalizePublicClients(record.nodes),
+    clients: record.clients === undefined ? undefined : normalizePublicClients(record.clients, options),
+    nodes: record.nodes === undefined ? undefined : normalizePublicClients(record.nodes, options),
     live: record.live === undefined ? undefined : normalizeLiveDataResponse(record.live),
     metadata_version: typeof record.metadata_version === 'string' ? record.metadata_version : undefined,
     snapshot_at: typeof record.snapshot_at === 'number' && Number.isFinite(record.snapshot_at) ? record.snapshot_at : undefined,
@@ -65,10 +66,23 @@ function readClientPatch(): PublicBootstrapClientPatch | null {
     const raw = getLocalStorageItem(PUBLIC_BOOTSTRAP_CLIENT_PATCH_KEY);
     if (!raw) return null;
     const stored = JSON.parse(raw) as Partial<PublicBootstrapClientPatch>;
-    if (!stored.saved_at || Date.now() - stored.saved_at > PUBLIC_BOOTSTRAP_CLIENT_PATCH_MAX_AGE_MS) return null;
+    if (
+      stored.version !== 2 ||
+      !stored.saved_at ||
+      Date.now() - stored.saved_at > PUBLIC_BOOTSTRAP_CLIENT_PATCH_MAX_AGE_MS
+    ) {
+      removeLocalStorageItem(PUBLIC_BOOTSTRAP_CLIENT_PATCH_KEY);
+      return null;
+    }
     clientPatchCache = {
+      version: 2,
       saved_at: stored.saved_at,
-      upsert: normalizePublicClients(stored.upsert),
+      upsert: Array.isArray(stored.upsert)
+        ? stored.upsert.flatMap((item) => {
+            const patch = normalizePublicClientPatch(item);
+            return patch ? [patch] : [];
+          })
+        : [],
       remove: Array.isArray(stored.remove)
         ? stored.remove.filter((uuid): uuid is string => typeof uuid === 'string' && uuid.trim() !== '')
         : [],
@@ -84,20 +98,35 @@ function writeClientPatch(patch: PublicBootstrapClientPatch): void {
   setLocalStorageItem(PUBLIC_BOOTSTRAP_CLIENT_PATCH_KEY, JSON.stringify(patch));
 }
 
-function clientPatchFromDetail(detail?: PublicBootstrapClientPatchDetail): Omit<PublicBootstrapClientPatch, 'saved_at'> | null {
+function normalizePublicClientPatch(raw: unknown): (Partial<ClientInfo> & { uuid: string }) | null {
+  const record = asRecord(raw);
+  const client = normalizePublicClient(record);
+  if (!record || !client) return null;
+  const patch: Partial<ClientInfo> & { uuid: string } = { uuid: client.uuid };
+  for (const key of Object.keys(client) as Array<keyof ClientInfo>) {
+    if (key !== 'uuid' && Object.prototype.hasOwnProperty.call(record, key)) {
+      (patch as Record<string, unknown>)[key] = client[key];
+    }
+  }
+  return patch;
+}
+
+function clientPatchFromDetail(detail?: PublicBootstrapClientPatchDetail): Omit<PublicBootstrapClientPatch, 'version' | 'saved_at'> | null {
   const rawUpserts = Array.isArray(detail?.clients?.upsert) ? detail.clients.upsert : [];
   const remove = new Set(Array.isArray(detail?.clients?.remove) ? detail.clients.remove : []);
+  const upsert: Array<Partial<ClientInfo> & { uuid: string }> = [];
   for (const raw of rawUpserts) {
     const record = asRecord(raw);
     const uuid = typeof record?.uuid === 'string' ? record.uuid.trim() : '';
     if (uuid && record?.hidden === true) remove.add(uuid);
+    const patch = normalizePublicClientPatch(record);
+    if (patch && patch.hidden !== true && !remove.has(patch.uuid)) upsert.push(patch);
   }
-  const upsert = normalizePublicClients(rawUpserts);
   if (upsert.length === 0 && remove.size === 0) return null;
   return { upsert, remove: [...remove] };
 }
 
-function mergeClientPatch(next: Omit<PublicBootstrapClientPatch, 'saved_at'>): PublicBootstrapClientPatch {
+function mergeClientPatch(next: Omit<PublicBootstrapClientPatch, 'version' | 'saved_at'>): PublicBootstrapClientPatch {
   const previous = readClientPatch();
   const remove = new Set(previous?.remove || []);
   const byUuid = new Map((previous?.upsert || []).map(client => [client.uuid, client]));
@@ -107,9 +136,9 @@ function mergeClientPatch(next: Omit<PublicBootstrapClientPatch, 'saved_at'>): P
   }
   for (const client of next.upsert) {
     remove.delete(client.uuid);
-    byUuid.set(client.uuid, client);
+    byUuid.set(client.uuid, { ...byUuid.get(client.uuid), ...client });
   }
-  return { saved_at: Date.now(), upsert: [...byUuid.values()], remove: [...remove] };
+  return { version: 2, saved_at: Date.now(), upsert: [...byUuid.values()], remove: [...remove] };
 }
 
 function applyClientPatch(clients: ClientInfo[] | undefined, patch: PublicBootstrapClientPatch | null): ClientInfo[] | undefined {
@@ -122,11 +151,12 @@ function applyClientPatch(clients: ClientInfo[] | undefined, patch: PublicBootst
   );
   for (const client of patch.upsert) {
     const existing = byUuid.get(client.uuid);
-    const next = { ...existing, ...client };
+    const next = existing ? { ...existing, ...client } : normalizePublicClient(client);
+    if (!next) continue;
     if (existing) {
       for (const [key, value] of Object.entries(client)) {
         if (typeof value === 'string' && value === '' && typeof existing[key as keyof ClientInfo] === 'string' && existing[key as keyof ClientInfo]) {
-          (next as Record<string, unknown>)[key] = existing[key as keyof ClientInfo];
+          (next as unknown as Record<string, unknown>)[key] = existing[key as keyof ClientInfo];
         }
       }
       if (client.price === 0 && existing.price !== 0) next.price = existing.price;
@@ -134,7 +164,7 @@ function applyClientPatch(clients: ClientInfo[] | undefined, patch: PublicBootst
     }
     byUuid.set(client.uuid, next);
   }
-  return [...byUuid.values()];
+  return sortPublicClients([...byUuid.values()]);
 }
 
 function applyStoredClientPatch(payload: PublicBootstrapPayload): PublicBootstrapPayload {
@@ -178,22 +208,24 @@ export function patchCachedPublicBootstrapClients(detail?: PublicBootstrapClient
   if (cached) savePublicBootstrap(applyStoredClientPatch(cached));
 }
 
-export async function fetchPublicBootstrap(options: { cache?: RequestCache; cacheBust?: boolean } = {}): Promise<PublicBootstrapPayload> {
-  if (bootstrapPromise && !options.cacheBust) return bootstrapPromise;
+export async function fetchPublicBootstrap(options: { cache?: RequestCache; cacheBust?: boolean; includeHidden?: boolean } = {}): Promise<PublicBootstrapPayload> {
+  const includeHidden = Boolean(options.includeHidden);
+  if (bootstrapPromise && !options.cacheBust && !includeHidden) return bootstrapPromise;
   const url = new URL('/api/public/bootstrap', typeof window === 'undefined' ? 'http://localhost' : window.location.origin);
   if (options.cacheBust) url.searchParams.set('_fresh', String(Date.now()));
-  const promise = fetchWithBootstrapRetry(`${url.pathname}${url.search}`, options.cache ? { cache: options.cache } : undefined)
+  if (includeHidden) url.searchParams.set('include_hidden', '1');
+  const promise: Promise<PublicBootstrapPayload> = fetchWithBootstrapRetry(`${url.pathname}${url.search}`, options.cache ? { cache: options.cache } : undefined)
     .then((res) => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return res.json();
     })
     .then((payload) => {
-      const normalized = normalizePublicBootstrap(payload);
-      return savePublicBootstrap(normalized);
+      const normalized = normalizePublicBootstrap(payload, { includeHidden });
+      return includeHidden ? normalized : savePublicBootstrap(normalized);
     })
     .finally(() => {
       if (bootstrapPromise === promise) bootstrapPromise = null;
     });
-  bootstrapPromise = promise;
-  return bootstrapPromise;
+  if (!includeHidden) bootstrapPromise = promise;
+  return promise;
 }

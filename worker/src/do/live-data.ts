@@ -18,6 +18,7 @@ import {
 } from '../settings/schema';
 import { bestEffortRecordHealthEvent, errorDetail } from '../utils/observability';
 import { isPublicIpAddress } from '../utils/request-ip';
+import { unwrapMonitorReportEnvelope } from '../utils/report-envelope';
 import { checkWebsiteMonitorHttp } from '../utils/website-monitor';
 
 // 客户端状态
@@ -524,17 +525,15 @@ export class LiveDataDO {
     const sourceIp = typeof network?.sourceIp === 'string' ? network.sourceIp.trim() : '';
     if (isPublicIpAddress(sourceIp)) {
       if (sourceIp.includes(':')) {
-        safeReport.ipv6 = sourceIp;
-        if (typeof safeReport.ipv4 === 'string' && !isPublicIpAddress(safeReport.ipv4)) delete safeReport.ipv4;
+        if (typeof safeReport.ipv6 !== 'string' || !isPublicIpAddress(safeReport.ipv6)) safeReport.ipv6 = sourceIp;
       } else {
-        safeReport.ipv4 = sourceIp;
-        if (typeof safeReport.ipv6 === 'string' && !isPublicIpAddress(safeReport.ipv6)) delete safeReport.ipv6;
+        if (typeof safeReport.ipv4 !== 'string' || !isPublicIpAddress(safeReport.ipv4)) safeReport.ipv4 = sourceIp;
       }
     }
 
     const region = typeof network?.region === 'string' ? network.region.trim() : '';
     const reportRegion = typeof safeReport.region === 'string' ? safeReport.region.trim() : '';
-    if (region && this.isUsefulRegion(region) && (!this.isUsefulRegion(reportRegion) || (isCountryCodeRegion(reportRegion) && isDetailedRegion(region)))) {
+    if (region && this.isUsefulRegion(region) && !this.isUsefulRegion(reportRegion)) {
       safeReport.region = region;
     }
     if (typeof safeReport.region === 'string' && !this.isUsefulRegion(safeReport.region)) {
@@ -1734,10 +1733,12 @@ export class LiveDataDO {
       return;
     }
 
-      const report = this.updateClientReport(clientId, clientName, hidden, data, now, undefined, ws);
-    this.runBackground('ping_persistence', this.persistPingResultsFromReport(clientId, data, now));
-    this.runBackground('website_probe_persistence', this.persistWebsiteProbeResultsFromReport(clientId, data, now));
-    this.runBackground('do_basic_info_sync', this.syncBasicInfoFromReport(clientId, clientName, hidden, report));
+    const rawReport = unwrapMonitorReportEnvelope(data);
+    const reportTime = this.reportTimestamp(rawReport, now);
+    const report = this.updateClientReport(clientId, clientName, hidden, rawReport, reportTime, undefined, ws);
+    this.runBackground('ping_persistence', this.persistPingResultsFromReport(clientId, rawReport, reportTime));
+    this.runBackground('website_probe_persistence', this.persistWebsiteProbeResultsFromReport(clientId, rawReport, reportTime));
+    this.runBackground('do_basic_info_sync', this.syncBasicInfoFromReport(clientId, clientName, hidden, rawReport));
 
     if (ws.readyState === WebSocket.READY_STATE_OPEN) {
       try {
@@ -1749,7 +1750,7 @@ export class LiveDataDO {
 
     // 持久化放在实时响应之后，避免数据库写入延迟阻塞 Agent WebSocket ack。
     this.runBackground('do_agent_policy', this.sendCurrentPolicyToAgent(ws, now, false, false, clientId));
-    this.runBackground('do_record_persistence', this.persistReport(clientId, report, now));
+    this.runBackground('do_record_persistence', this.persistReport(clientId, report, reportTime));
   }
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {

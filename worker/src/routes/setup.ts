@@ -293,12 +293,21 @@ create table if not exists cfm_internal.setup_migrations (
 `);
 }
 
-async function listAppliedMigrations(projectRef: string, accessToken: string): Promise<Set<string>> {
-  const payload = await runSupabaseQuery(projectRef, accessToken, 'select version from cfm_internal.setup_migrations order by version;');
-  return new Set(
+type AppliedMigration = {
+  version: string;
+  checksum: string;
+};
+
+async function listAppliedMigrations(projectRef: string, accessToken: string): Promise<Map<string, AppliedMigration>> {
+  const payload = await runSupabaseQuery(projectRef, accessToken, 'select version, checksum from cfm_internal.setup_migrations order by version;');
+  return new Map(
     extractQueryRows(payload)
-      .map(row => typeof row.version === 'string' ? row.version : '')
-      .filter(Boolean),
+      .map(row => ({
+        version: typeof row.version === 'string' ? row.version : '',
+        checksum: typeof row.checksum === 'string' ? row.checksum : '',
+      }))
+      .filter(item => item.version)
+      .map(item => [item.version, item]),
   );
 }
 
@@ -306,10 +315,15 @@ function migrationQuery(migration: BundledMigration): string {
   return `
 begin;
 select pg_advisory_xact_lock(86421025);
-insert into cfm_internal.setup_migrations (version, name, checksum)
-values (${sqlString(migration.version)}, ${sqlString(migration.name)}, ${sqlString(migration.checksum)});
 
 ${migration.sql}
+
+insert into cfm_internal.setup_migrations (version, name, checksum)
+values (${sqlString(migration.version)}, ${sqlString(migration.name)}, ${sqlString(migration.checksum)})
+on conflict (version) do update
+set name = excluded.name,
+    checksum = excluded.checksum,
+    applied_at = now();
 
 commit;
 `;
@@ -321,18 +335,18 @@ async function applyBundledMigrations(projectRef: string, accessToken: string) {
   const results: Array<{ version: string; name: string; status: 'applied' | 'skipped' }> = [];
 
   for (const migration of BUNDLED_SUPABASE_MIGRATIONS) {
-    if (applied.has(migration.version)) {
+    if (applied.get(migration.version)?.checksum === migration.checksum) {
       results.push({ version: migration.version, name: migration.name, status: 'skipped' });
       continue;
     }
     try {
       await runSupabaseQuery(projectRef, accessToken, migrationQuery(migration));
-      applied.add(migration.version);
+      applied.set(migration.version, migration);
       results.push({ version: migration.version, name: migration.name, status: 'applied' });
     } catch (error) {
       const afterFailure = await listAppliedMigrations(projectRef, accessToken).catch(() => applied);
-      if (afterFailure.has(migration.version)) {
-        applied.add(migration.version);
+      if (afterFailure.get(migration.version)?.checksum === migration.checksum) {
+        applied.set(migration.version, migration);
         results.push({ version: migration.version, name: migration.name, status: 'skipped' });
         continue;
       }
