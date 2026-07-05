@@ -25,6 +25,7 @@ import { sanitizeSetupDiagnosticDetail } from '../utils/setup-diagnostics';
 import { getCloudflareClientIp } from '../utils/request-ip';
 import { readLiveSnapshot, readRateLimitResult } from '../utils/do-response';
 import { readJsonWithLimit } from '../utils/request-body';
+import { base64ToBytes } from '../utils/theme-package';
 
 const publicRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 type PublicContext = Context<{ Bindings: Bindings; Variables: Variables }>;
@@ -60,6 +61,7 @@ const LOGOUT_CLEAR_SITE_DATA_HEADER = '"cache"';
 const DUMMY_ADMIN_PASSWORD_HASH = 'pbkdf2_sha256$10000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
 const MAX_ADMIN_RECOVERY_KEY_LENGTH = 8192;
 const MAX_ADMIN_RECOVERY_USERNAME_BYTES = 64;
+const SITE_LOGO_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
 type PublicRateLimitBucket = {
   count: number;
@@ -491,7 +493,7 @@ function privateJsonResponse(value: unknown): Response {
   });
 }
 
-async function hasAdminSession(c: PublicContext): Promise<boolean> {
+export async function hasAdminSession(c: PublicContext): Promise<boolean> {
   const token = getAdminSessionToken(c);
   if (!token) return false;
   try {
@@ -1208,6 +1210,22 @@ publicRoutes.get('/me', async (c) => {
 });
 
 // 获取所有客户端列表（公开）
+publicRoutes.get('/site-logo', async (c) => {
+  const settings = await db.getSettingsByKeys(getDatabase(c.env), ['site_logo_data', 'site_logo_type']);
+  const contentBase64 = settings.site_logo_data || '';
+  const contentType = settings.site_logo_type || '';
+  if (!contentBase64 || !SITE_LOGO_TYPES.has(contentType)) return c.body(null, 404);
+
+  return new Response(base64ToBytes(contentBase64), {
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=300, s-maxage=300, stale-while-revalidate=600',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    },
+  });
+});
+
 publicRoutes.get('/clients', async (c) => {
   const fresh = isFreshPublicMetadataRequest(c);
   const includeHidden = c.req.query('include_hidden') === '1' && await hasAdminSession(c);
@@ -1243,7 +1261,7 @@ publicRoutes.get('/public/bootstrap', async (c) => {
     getPublicClientsSnapshot(c, getDatabase(c.env), fresh, includeHidden),
     c.env.LIVE_DATA
       .get(c.env.LIVE_DATA.idFromName('global'))
-      .fetch(new Request('https://do/live', { method: 'GET' }))
+      .fetch(new Request(`https://do/live${includeHidden ? '?include_hidden=1' : ''}`, { method: 'GET' }))
       .then(response => readLiveSnapshot(response))
       .then(snapshot => snapshot ?? { online: [], count: 0 }),
   ]);
@@ -1524,13 +1542,19 @@ publicRoutes.get('/nodes', async (c) => {
 publicRoutes.get('/live', async (c) => {
   const limited = await guardPublicLive(c);
   if (limited) return limited;
-  const cached = await getPublicEdgeCache(c, PUBLIC_LIVE_CACHE_SECONDS);
+  const includeHidden = c.req.query('include_hidden') === '1' && await hasAdminSession(c);
+  const cached = includeHidden ? null : await getPublicEdgeCache(c, PUBLIC_LIVE_CACHE_SECONDS);
   if (cached) return cached;
 
   const doId = c.env.LIVE_DATA.idFromName('global');
   const stub = c.env.LIVE_DATA.get(doId);
-  const response = withPublicCacheHeader(c, await stub.fetch(c.req.raw), PUBLIC_LIVE_CACHE_SECONDS, 'miss');
-  putPublicEdgeCache(c, response);
+  const doUrl = new URL(c.req.url);
+  if (includeHidden) doUrl.searchParams.set('include_hidden', '1');
+  else doUrl.searchParams.delete('include_hidden');
+  const response = includeHidden
+    ? privateJsonResponse(await (await stub.fetch(new Request(doUrl.toString(), c.req.raw))).json())
+    : withPublicCacheHeader(c, await stub.fetch(new Request(doUrl.toString(), c.req.raw)), PUBLIC_LIVE_CACHE_SECONDS, 'miss');
+  if (!includeHidden) putPublicEdgeCache(c, response);
   return response;
 });
 

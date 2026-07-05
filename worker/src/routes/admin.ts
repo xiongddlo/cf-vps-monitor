@@ -31,13 +31,13 @@ import { EMAIL_MESSAGE_MAX_CHARS, normalizeRecipients, sendSmtpEmail, type SmtpC
 import { sanitizeSetupDiagnosticDetail } from '../utils/setup-diagnostics';
 import { checkWebsiteMonitorHttp, validateWebsiteMonitorInput } from '../utils/website-monitor';
 import { readLiveSnapshot, readRateLimitResult } from '../utils/do-response';
-import { readJsonWithLimit } from '../utils/request-body';
+import { readJsonWithLimit, readRequestBytesWithLimit } from '../utils/request-body';
+import { bytesToBase64 } from '../utils/theme-package';
 import { APP_VERSION } from '../utils/app-version';
 import {
-  branchPackageJsonUrl,
   compareVersions,
+  repositoryUrlFromRepositoryUrl,
   normalizeGitSha,
-  shortGitSha,
   workflowUrlFromRepositoryUrl,
   type UpdateCheckResult,
 } from '../utils/update-check';
@@ -72,7 +72,7 @@ const ADMIN_PING_TASKS_EDGE_CACHE_SECONDS = 15;
 const ADMIN_SETTINGS_SCOPE_CACHE_MS = 10_000;
 const HEALTH_CACHE_MS = 30_000;
 const ALLOWED_CLIENT_IDS_CACHE_MS = 30_000;
-const DEFAULT_UPDATE_SOURCE_REPOSITORY = 'kadidalax/cf-vps-monitor';
+const OFFICIAL_UPDATE_REPOSITORY = 'kadidalax/cf-vps-monitor';
 const UPDATE_CHECK_CACHE_MS = 10 * 60 * 1000;
 const updateCheckCache = new Map<string, { expiresAt: number; value: UpdateCheckResult }>();
 const LIVE_POLICY_SETTING_KEYS = new Set([
@@ -106,6 +106,7 @@ const SETTINGS_SCOPE_KEYS = {
     'site_description',
     'language',
     'script_domain',
+    'site_logo_url',
   ],
   general: [
     'record_enabled',
@@ -134,6 +135,10 @@ const SETTINGS_SCOPE_KEYS = {
     'email_smtp_auth_method',
     'enable_ip_change_notification',
     'offline_notify_never_reported',
+  ],
+  update: [
+    'update_mode',
+    'update_repository_url',
   ],
 } as const satisfies Record<string, readonly (keyof typeof SETTING_SCHEMA)[]>;
 const MAINTENANCE_CLEANUP_SETTING_KEYS = [
@@ -168,6 +173,7 @@ const AGENT_TOKEN_ROTATION_WARNING_MS = 180 * 24 * 60 * 60 * 1000;
 const AGENT_TOKEN_UNUSED_WARNING_MS = 7 * 24 * 60 * 60 * 1000;
 const AGENT_TOKEN_STALE_USE_WARNING_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_ADMIN_JSON_BYTES = 256 * 1024;
+const MAX_SITE_LOGO_BYTES = 1024 * 1024;
 
 type LiveClientMeta = Partial<Omit<db.Client, 'token' | 'token_hash'>> & Pick<db.Client, 'uuid'>;
 type AdminClientsSnapshot = {
@@ -230,6 +236,21 @@ function runAdminBackground(c: AdminContext, task: Promise<unknown>): void {
 
 function isJsonObjectBody(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isUploadedFile(value: unknown): value is { arrayBuffer(): Promise<ArrayBuffer>; type?: string } {
+  return !!value && typeof value === 'object' && 'arrayBuffer' in value && typeof value.arrayBuffer === 'function';
+}
+
+function detectSiteLogoType(bytes: Uint8Array): string | null {
+  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) return 'image/webp';
+  return null;
 }
 
 function summarizeTelegramTestResult(response: Response, result: unknown): {
@@ -1246,30 +1267,8 @@ type GitHubLatestRelease = {
   published_at?: unknown;
 };
 
-type GitHubBranch = {
-  name?: unknown;
-  commit?: {
-    sha?: unknown;
-    html_url?: unknown;
-    commit?: {
-      message?: unknown;
-      author?: {
-        date?: unknown;
-      };
-    };
-  };
-};
-
 function releaseString(value: unknown): string {
   return typeof value === 'string' ? value : '';
-}
-
-function updateSourceRepository(env: Bindings): string {
-  return env.UPDATE_SOURCE_REPOSITORY?.trim() || DEFAULT_UPDATE_SOURCE_REPOSITORY;
-}
-
-function updateSourceBranch(env: Bindings): string {
-  return env.UPDATE_SOURCE_BRANCH?.trim() || '';
 }
 
 async function fetchGitHubJson<T>(path: string): Promise<T> {
@@ -1289,88 +1288,59 @@ function fetchLatestRelease(repository: string): Promise<GitHubLatestRelease> {
   return fetchGitHubJson<GitHubLatestRelease>(`repos/${repository}/releases/latest`);
 }
 
-function fetchBranch(repository: string, branch: string): Promise<GitHubBranch> {
-  return fetchGitHubJson<GitHubBranch>(`repos/${repository}/branches/${encodeURIComponent(branch)}`);
+async function getUpdateSettings(c: AdminContext): Promise<{
+  mode: 'actions' | 'fork';
+  repositoryUrl: string;
+}> {
+  const database = getDatabase(c.env);
+  const stored = await db.getSettingsByKeys(database, ['update_mode', 'update_repository_url'], true);
+  const settings = buildAdminSettings(stored);
+  return {
+    mode: settings.update_mode === 'fork' ? 'fork' : 'actions',
+    repositoryUrl: settings.update_repository_url,
+  };
 }
 
-async function fetchBranchPackageVersion(repository: string, branch: string): Promise<string> {
-  const response = await fetch(branchPackageJsonUrl(repository, branch), {
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'cf-vps-monitor-update-check',
-    },
-  });
-  if (!response.ok) return '';
-  const data = await response.json() as { version?: unknown };
-  return typeof data.version === 'string' ? data.version.trim() : '';
-}
-
-async function buildReleaseUpdateResult(c: AdminContext, repository: string): Promise<UpdateCheckResult> {
+async function buildReleaseUpdateResult(
+  repository: string,
+  mode: 'actions' | 'fork',
+  deploymentRepositoryUrl: string,
+): Promise<UpdateCheckResult> {
   const release = await fetchLatestRelease(repository);
   const latestVersion = releaseString(release.tag_name) || 'dev';
   const currentVersion = APP_VERSION;
-  const actionsUrl = workflowUrlFromRepositoryUrl(c.env.GITHUB_REPOSITORY_URL);
+  const repositoryUrl = repositoryUrlFromRepositoryUrl(deploymentRepositoryUrl);
+  const actionsUrl = workflowUrlFromRepositoryUrl(repositoryUrl || undefined);
+  const upgradeUrl = mode === 'fork' ? repositoryUrl : actionsUrl;
   return {
     current_version: currentVersion.startsWith('v') ? currentVersion : `v${currentVersion}`,
     latest_version: latestVersion.startsWith('v') ? latestVersion : `v${latestVersion}`,
     has_update: compareVersions(latestVersion, currentVersion) > 0,
     release_url: releaseString(release.html_url),
+    upgrade_url: upgradeUrl,
     actions_url: actionsUrl,
-    workflow_configured: Boolean(actionsUrl),
+    workflow_configured: Boolean(upgradeUrl),
+    update_mode: mode,
+    repository_url: repositoryUrl,
     title: releaseString(release.name) || latestVersion,
     body: releaseString(release.body),
     published_at: releaseString(release.published_at),
   };
 }
 
-async function buildBranchUpdateResult(c: AdminContext, repository: string, branch: string): Promise<UpdateCheckResult> {
-  const [branchData, latestPackageVersion] = await Promise.all([
-    fetchBranch(repository, branch),
-    fetchBranchPackageVersion(repository, branch).catch(() => ''),
-  ]);
-  const latestSha = normalizeGitSha(releaseString(branchData.commit?.sha));
-  const currentSha = normalizeGitSha(c.env.CURRENT_GIT_COMMIT);
-  const actionsUrl = workflowUrlFromRepositoryUrl(c.env.GITHUB_REPOSITORY_URL);
-  const commitUrl = releaseString(branchData.commit?.html_url) ||
-    `https://github.com/${repository}/tree/${encodeURIComponent(branch)}`;
-  const message = releaseString(branchData.commit?.commit?.message);
-  const publishedAt = releaseString(branchData.commit?.commit?.author?.date);
-  const latestDisplayVersion = latestPackageVersion
-    ? latestPackageVersion.startsWith('v') ? latestPackageVersion : `v${latestPackageVersion}`
-    : latestSha ? shortGitSha(latestSha) : branch;
-  const currentDisplayVersion = latestPackageVersion && currentSha && latestSha === currentSha
-    ? latestDisplayVersion
-    : APP_VERSION.startsWith('v') ? APP_VERSION : `v${APP_VERSION}`;
-  const shaSummary = latestSha ? `\n\n最新提交：${shortGitSha(latestSha)}${currentSha ? `\n当前部署：${shortGitSha(currentSha)}` : ''}` : '';
-  return {
-    current_version: currentDisplayVersion,
-    latest_version: latestDisplayVersion,
-    has_update: Boolean(latestSha && (!currentSha || latestSha !== currentSha)),
-    release_url: commitUrl,
-    actions_url: actionsUrl,
-    workflow_configured: Boolean(actionsUrl),
-    title: `${repository}@${branch}`,
-    body: `${message || `远程分支 ${branch} 的最新提交。`}${shaSummary}`,
-    published_at: publishedAt,
-  };
-}
-
-// ============ 系统更新 ============
 
 adminRoutes.get('/update-check', async (c) => {
   const now = Date.now();
-  const repository = updateSourceRepository(c.env);
-  const branch = updateSourceBranch(c.env);
-  const cacheKey = `${repository}:${branch || 'release'}:${normalizeGitSha(c.env.CURRENT_GIT_COMMIT)}`;
-  const cached = updateCheckCache.get(cacheKey);
-  if (c.req.query('refresh') !== '1' && cached && cached.expiresAt > now) {
-    return c.json(cached.value);
-  }
-
   try {
-    const result = branch
-      ? await buildBranchUpdateResult(c, repository, branch)
-      : await buildReleaseUpdateResult(c, repository);
+    const { mode, repositoryUrl } = await getUpdateSettings(c);
+    const repository = OFFICIAL_UPDATE_REPOSITORY;
+    const cacheKey = `${repository}:release:${mode}:${repositoryUrl}:${normalizeGitSha(c.env.CURRENT_GIT_COMMIT)}`;
+    const cached = updateCheckCache.get(cacheKey);
+    if (c.req.query('refresh') !== '1' && cached && cached.expiresAt > now) {
+      return c.json(cached.value);
+    }
+
+    const result = await buildReleaseUpdateResult(repository, mode, repositoryUrl);
     updateCheckCache.set(cacheKey, { expiresAt: now + UPDATE_CHECK_CACHE_MS, value: result });
     return c.json(result);
   } catch (error) {
@@ -2123,6 +2093,55 @@ adminRoutes.post('/websites/:id/check', async (c) => {
 });
 
 // ============ 系统设置 ============
+
+// 站点 Logo
+adminRoutes.post('/site-logo', async (c) => {
+  const body = await readRequestBytesWithLimit(c.req.raw, MAX_SITE_LOGO_BYTES + 4096);
+  if (!body.ok) return c.json({ error: `Logo 不能超过 ${MAX_SITE_LOGO_BYTES} 字节` }, 413);
+
+  let form: FormData;
+  try {
+    form = await new Response(body.bytes, {
+      headers: { 'Content-Type': c.req.header('Content-Type') || '' },
+    }).formData();
+  } catch {
+    return c.json({ error: 'Logo 表单格式错误' }, 400);
+  }
+
+  const file = form.get('file');
+  if (!isUploadedFile(file)) return c.json({ error: '请上传 Logo 图片' }, 400);
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.byteLength > MAX_SITE_LOGO_BYTES) return c.json({ error: `Logo 不能超过 ${MAX_SITE_LOGO_BYTES} 字节` }, 413);
+
+  const contentType = detectSiteLogoType(bytes);
+  if (!contentType) return c.json({ error: 'Logo 只支持 PNG、JPG、WebP' }, 400);
+
+  const database = getDatabase(c.env);
+  const version = String(Date.now());
+  const siteLogoUrl = `/api/site-logo?v=${version}`;
+  await db.setSettings(database, {
+    site_logo_data: bytesToBase64(bytes),
+    site_logo_type: contentType,
+    site_logo_url: siteLogoUrl,
+  });
+  invalidateAdminSettingsCache();
+  await invalidateAdminPublicMetadata(c);
+  await db.insertAuditLog(database, c.get('username')!, 'settings_save', '上传站点 Logo');
+  return c.json({ success: true, site_logo_url: siteLogoUrl });
+});
+
+adminRoutes.post('/site-logo/reset', async (c) => {
+  const database = getDatabase(c.env);
+  await db.setSettings(database, {
+    site_logo_data: '',
+    site_logo_type: '',
+    site_logo_url: '',
+  });
+  invalidateAdminSettingsCache();
+  await invalidateAdminPublicMetadata(c);
+  await db.insertAuditLog(database, c.get('username')!, 'settings_save', '恢复默认站点 Logo');
+  return c.json({ success: true, site_logo_url: '' });
+});
 
 // 获取所有设置
 adminRoutes.get('/settings', async (c) => {

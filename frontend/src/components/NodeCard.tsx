@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Badge, Box, Card, Flex, IconButton, Separator, Text } from '@radix-ui/themes';
+import { Badge, Box, Card, Flex, IconButton, Separator, Text, Tooltip } from '@radix-ui/themes';
 import { Activity, ArrowDown, ArrowUp, BarChart3, TrendingUp } from 'lucide-react';
 import Flag from './Flag';
 import PriceTags from './PriceTags';
@@ -10,11 +10,46 @@ import { formatTrafficLimitLabel, parseTrafficLimitType } from '../utils/traffic
 import { ClientInfo, LiveRecord } from '../types';
 import { getOSDisplay } from '../utils/osIcon';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { formatCpuCardLabel, formatCpuSpec } from '../utils/cpuFormat';
+import { parseMonitorTags } from '../utils/tags';
 
 interface NodeCardProps {
   client: ClientInfo;
   live?: LiveRecord;
   online: boolean;
+}
+
+function NodeRegionTagsLine({ region, tags }: { region?: string; tags?: string }) {
+  const tagTexts = parseMonitorTags(tags).map((tag) => tag.text);
+  const regionLabel = region || '未知';
+  const tooltipContent = (
+    <span className="node-card-tag-tooltip-content">
+      <span className="node-card-tag-tooltip-region">{regionLabel}</span>
+      <span className="node-card-tag-tooltip-tags">
+        {tagTexts.map((tag, index) => (
+          <span className="node-card-tag-tooltip-pill" key={`${tag}-${index}`}>{tag}</span>
+        ))}
+      </span>
+    </span>
+  );
+  const line = (
+    <div className="node-card-region-line node-card-region-tags-line">
+      <span className="node-card-region-text">{regionLabel}</span>
+      {tagTexts.length > 0 && (
+        <span className="node-card-header-tags" aria-label={`标签 ${tagTexts.join(' ')}`}>
+          {tagTexts.map((tag, index) => (
+            <span className="node-card-header-tag" key={`${tag}-${index}`}>{tag}</span>
+          ))}
+        </span>
+      )}
+    </div>
+  );
+
+  return tagTexts.length > 0 ? (
+    <Tooltip className="node-card-tag-tooltip" content={tooltipContent} side="bottom">
+      {line}
+    </Tooltip>
+  ) : line;
 }
 
 function clampPercent(value: number) {
@@ -27,11 +62,13 @@ function CompactMetric({
   value,
   detail,
   percent,
+  title,
 }: {
   label: string;
   value: string;
   detail: string;
   percent?: number;
+  title?: string;
 }) {
   return (
     <div className="node-metric-tile" data-load={typeof percent === 'number' ? (percent >= 85 ? 'hot' : percent >= 65 ? 'warm' : 'normal') : undefined}>
@@ -39,7 +76,7 @@ function CompactMetric({
         <Text className="node-metric-label" size="1">{label}</Text>
         <Text className="node-metric-value" size="2" weight="bold">{value}</Text>
       </Flex>
-      <Text className="node-metric-detail" size="1">{detail}</Text>
+      <Text className="node-metric-detail" size="1" title={title || detail}>{detail}</Text>
       {typeof percent === 'number' && (
         <span className="node-metric-bar" aria-hidden="true">
           <span style={{ transform: `scaleX(${clampPercent(percent) / 100})` }} />
@@ -206,6 +243,8 @@ export default function NodeCard({ client, live, online }: NodeCardProps) {
   const uptimeFooterLabel = online ? uptimeLabel : '当前离线';
   const memDetail = `${formatBytes(d.ram)} / ${formatBytes(memTotal)}`;
   const diskDetail = `${formatBytes(d.disk)} / ${formatBytes(diskTotal)}`;
+  const cpuDetail = formatCpuCardLabel(client.cpu_name, client.cpu_cores);
+  const cpuTitle = formatCpuSpec(client.cpu_name, client.cpu_cores);
 
   const trafficUsed = (() => {
     if (!client.traffic_limit || client.traffic_limit <= 0) return 0;
@@ -236,7 +275,7 @@ export default function NodeCard({ client, live, online }: NodeCardProps) {
     >
       <Link className="node-card-link" to={`/instance/${client.uuid}`} onClick={handleCardLinkClick} style={{ textDecoration: 'none', color: 'inherit' }}>
         <Flex className="node-card-body" direction="column" gap="2">
-          <Flex className="node-card-header" justify="between" align="start" my={isMobile ? '-1' : '0'}>
+          <Flex className="node-card-header" justify="between" align="start" my={isMobile ? '-1' : '0'} data-has-message={d.message ? 'true' : undefined}>
             <Flex justify="start" align="center" style={{ flex: 1, minWidth: 0 }}>
               <Flex direction="column" style={{ minWidth: 0, flex: 1 }}>
                 <Flex className="node-card-title-row" align="center" gap="2">
@@ -252,9 +291,7 @@ export default function NodeCard({ client, live, online }: NodeCardProps) {
                     {client.name}
                   </Text>
                 </Flex>
-                <Text className="node-card-region-line" size="1" color="gray" truncate title={client.region || '未知'}>
-                  {client.region || '未知'}
-                </Text>
+                <NodeRegionTagsLine region={client.region} tags={client.tags} />
               </Flex>
             </Flex>
 
@@ -328,7 +365,7 @@ export default function NodeCard({ client, live, online }: NodeCardProps) {
 
             <div className="node-card-next-layout" data-monitor-layout="next">
               <div className="node-metric-grid">
-                <CompactMetric label="CPU" value={formatPercent(cpuPct)} detail="处理器" percent={cpuPct} />
+                <CompactMetric label="CPU" value={formatPercent(cpuPct)} detail={cpuDetail} title={cpuTitle} percent={cpuPct} />
                 <CompactMetric label="内存" value={formatPercent(memPct)} detail={memDetail} percent={memPct} />
                 <CompactMetric label="磁盘" value={formatPercent(diskPct)} detail={diskDetail} percent={diskPct} />
                 <CompactMetric

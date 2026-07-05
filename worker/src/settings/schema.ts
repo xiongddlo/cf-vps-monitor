@@ -57,6 +57,37 @@ export const SETTING_SCHEMA = {
     public: true,
     maxLength: 256,
   },
+  site_logo_url: {
+    type: 'string',
+    defaultValue: '',
+    public: true,
+    maxLength: 256,
+  },
+  site_logo_data: {
+    type: 'string',
+    defaultValue: '',
+    public: false,
+    sensitive: true,
+    maxLength: 1500000,
+  },
+  site_logo_type: {
+    type: 'string',
+    defaultValue: '',
+    public: false,
+    maxLength: 64,
+  },
+  update_mode: {
+    type: 'enum',
+    defaultValue: 'actions',
+    public: false,
+    values: ['actions', 'fork'],
+  },
+  update_repository_url: {
+    type: 'string',
+    defaultValue: '',
+    public: false,
+    maxLength: 256,
+  },
   record_enabled: {
     type: 'boolean',
     defaultValue: 'true',
@@ -304,6 +335,36 @@ function normalizeScriptDomain(value: unknown): string | null {
   }
 }
 
+function normalizeSiteLogoUrl(value: unknown): string | null {
+  if (value === '' || value === null || value === undefined) return '';
+  if (typeof value !== 'string') return null;
+  const raw = value.trim();
+  return /^\/api\/site-logo(?:\?v=\d+)?$/.test(raw) ? raw : null;
+}
+
+function normalizeUpdateRepositoryUrl(value: unknown): string | null {
+  if (value === '' || value === null || value === undefined) return '';
+  if (typeof value !== 'string') return null;
+  const raw = value.trim();
+  const withScheme = /^https?:\/\//i.test(raw)
+    ? raw
+    : raw.startsWith('github.com/')
+      ? `https://${raw}`
+      : /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(raw)
+        ? `https://github.com/${raw}`
+        : raw;
+  try {
+    const url = new URL(withScheme);
+    if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com') return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+    const parts = url.pathname.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '').split('/');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+    return `https://github.com/${parts[0]}/${parts[1]}`;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeSmtpHost(value: unknown): string | null {
   if (value === '' || value === null || value === undefined) return '';
   if (typeof value !== 'string') return null;
@@ -365,6 +426,8 @@ export function normalizeSettingValue(
     }
     case 'string':
       if (key === 'script_domain') normalized = normalizeScriptDomain(value);
+      else if (key === 'site_logo_url') normalized = normalizeSiteLogoUrl(value);
+      else if (key === 'update_repository_url') normalized = normalizeUpdateRepositoryUrl(value);
       else if (key === 'email_smtp_host') normalized = normalizeSmtpHost(value);
       else if (key === 'email_smtp_from_address') normalized = normalizeEmailAddress(value);
       else if (key === 'email_smtp_recipients') normalized = normalizeEmailRecipients(value);

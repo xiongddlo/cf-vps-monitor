@@ -679,7 +679,7 @@ function EditDialog({ client, open, onOpenChange, onSaved }: { client: AdminClie
             />
             <Flex className="billing-switch-row" gap="3">
               <Flex className="billing-switch-item" align="center" justify="between">
-                <Text size="2">隐藏节点</Text>
+                <Text size="2">对游客隐藏</Text>
                 <Switch checked={Boolean(form.hidden)} onCheckedChange={v => update('hidden', v)} />
               </Flex>
               <Flex className="billing-switch-item" align="center" justify="between">
@@ -884,7 +884,12 @@ export default function AdminDashboard() {
       toast.success(`已隐藏 ${result.updated ?? selectedNodes.length} 个节点`);
       setClients((prev) => prev.map((client) => selectedNodes.includes(client.uuid) ? { ...client, hidden: true } : client));
       setSelectedNodes([]);
-      notifyPublicDataUpdated({ clients: { remove: selectedNodes } });
+      notifyPublicDataUpdated({
+        clients: {
+          upsert: clients.filter((client) => selectedNodes.includes(client.uuid)).map((client) => ({ ...client, hidden: true })),
+          remove: selectedNodes,
+        },
+      });
     } catch (error) { toast.error(error instanceof Error ? error.message : '批量隐藏失败'); }
   };
 
@@ -1011,9 +1016,9 @@ export default function AdminDashboard() {
         icon: <Layers size={18} />,
       },
       {
-        label: '隐藏节点',
+        label: '对游客隐藏',
         value: String(hiddenCount),
-        detail: '不会出现在前台',
+        detail: '不会出现在游客前台',
         icon: <EyeOff size={18} />,
       },
     ];
