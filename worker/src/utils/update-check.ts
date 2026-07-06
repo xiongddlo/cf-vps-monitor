@@ -1,45 +1,20 @@
 export type UpdateCheckResult = {
   current_version: string;
   latest_version: string;
+  current_commit: string;
+  latest_commit: string;
   has_update: boolean;
-  release_url: string;
+  source_url: string;
   upgrade_url: string | null;
-  actions_url: string | null;
-  workflow_configured: boolean;
-  update_mode: 'actions' | 'fork';
   repository_url: string | null;
   title: string;
   body: string;
   published_at: string;
 };
 
-export function normalizeVersion(version: string): string {
-  return version.trim().replace(/^v/i, '');
-}
-
-function parseSemver(version: string): [number, number, number] | null {
-  const match = normalizeVersion(version).match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-
-export function compareVersions(a: string, b: string): -1 | 0 | 1 {
-  const parsedA = parseSemver(a);
-  const parsedB = parseSemver(b);
-  if (parsedA && parsedB) {
-    for (let i = 0; i < 3; i += 1) {
-      if (parsedA[i] > parsedB[i]) return 1;
-      if (parsedA[i] < parsedB[i]) return -1;
-    }
-    return 0;
-  }
-
-  const normalizedA = normalizeVersion(a);
-  const normalizedB = normalizeVersion(b);
-  if (normalizedA === normalizedB) return 0;
-  if (normalizedA === 'dev') return -1;
-  if (normalizedB === 'dev') return 1;
-  return normalizedA > normalizedB ? 1 : -1;
+export function formatAppVersion(version: string | undefined): string {
+  const value = (version || '').trim() || 'dev';
+  return value.startsWith('v') || value === 'dev' ? value : `v${value}`;
 }
 
 export function canonicalGitHubRepositoryUrl(repositoryUrl: string | undefined): string | null {
@@ -66,11 +41,6 @@ export function canonicalGitHubRepositoryUrl(repositoryUrl: string | undefined):
 
 export function repositoryUrlFromRepositoryUrl(repositoryUrl: string | undefined): string | null {
   return canonicalGitHubRepositoryUrl(repositoryUrl);
-}
-
-export function workflowUrlFromRepositoryUrl(repositoryUrl: string | undefined): string | null {
-  const repository = canonicalGitHubRepositoryUrl(repositoryUrl);
-  return repository ? `${repository}/actions/workflows/update-from-upstream.yml` : null;
 }
 
 export function normalizeGitSha(value: string | undefined): string {

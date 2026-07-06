@@ -35,10 +35,10 @@ import { readJsonWithLimit, readRequestBytesWithLimit } from '../utils/request-b
 import { bytesToBase64 } from '../utils/theme-package';
 import { APP_VERSION } from '../utils/app-version';
 import {
-  compareVersions,
+  formatAppVersion,
   repositoryUrlFromRepositoryUrl,
   normalizeGitSha,
-  workflowUrlFromRepositoryUrl,
+  shortGitSha,
   type UpdateCheckResult,
 } from '../utils/update-check';
 import { deleteAdminSessionEdgeCache, invalidatePublicMetadataCache, purgePublicMetadataEdgeCache } from './public';
@@ -73,6 +73,7 @@ const ADMIN_SETTINGS_SCOPE_CACHE_MS = 10_000;
 const HEALTH_CACHE_MS = 30_000;
 const ALLOWED_CLIENT_IDS_CACHE_MS = 30_000;
 const OFFICIAL_UPDATE_REPOSITORY = 'kadidalax/cf-vps-monitor';
+const OFFICIAL_UPDATE_BRANCH = 'main';
 const UPDATE_CHECK_CACHE_MS = 10 * 60 * 1000;
 const updateCheckCache = new Map<string, { expiresAt: number; value: UpdateCheckResult }>();
 const LIVE_POLICY_SETTING_KEYS = new Set([
@@ -137,7 +138,6 @@ const SETTINGS_SCOPE_KEYS = {
     'offline_notify_never_reported',
   ],
   update: [
-    'update_mode',
     'update_repository_url',
   ],
 } as const satisfies Record<string, readonly (keyof typeof SETTING_SCHEMA)[]>;
@@ -1259,15 +1259,17 @@ async function runMaintenanceCleanup(database: db.QueryDatabase, username: strin
   return result;
 }
 
-type GitHubLatestRelease = {
-  tag_name?: unknown;
+type GitHubCommitInfo = {
+  sha?: unknown;
   html_url?: unknown;
-  name?: unknown;
-  body?: unknown;
-  published_at?: unknown;
+  commit?: {
+    message?: unknown;
+    committer?: { date?: unknown };
+    author?: { date?: unknown };
+  };
 };
 
-function releaseString(value: unknown): string {
+function updateString(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
@@ -1284,47 +1286,53 @@ async function fetchGitHubJson<T>(path: string): Promise<T> {
   return await response.json();
 }
 
-function fetchLatestRelease(repository: string): Promise<GitHubLatestRelease> {
-  return fetchGitHubJson<GitHubLatestRelease>(`repos/${repository}/releases/latest`);
+function fetchLatestCommit(repository: string): Promise<GitHubCommitInfo> {
+  return fetchGitHubJson<GitHubCommitInfo>(`repos/${repository}/commits/${OFFICIAL_UPDATE_BRANCH}`);
 }
 
-async function getUpdateSettings(c: AdminContext): Promise<{
-  mode: 'actions' | 'fork';
-  repositoryUrl: string;
-}> {
+async function fetchLatestWorkerVersion(repository: string, commitSha: string): Promise<string> {
+  const response = await fetch(`https://raw.githubusercontent.com/${repository}/${commitSha}/worker/package.json`, {
+    headers: { 'User-Agent': 'cf-vps-monitor-update-check' },
+  });
+  if (!response.ok) return 'dev';
+  const body = await response.json().catch(() => null);
+  return body && typeof body === 'object' && typeof (body as { version?: unknown }).version === 'string'
+    ? (body as { version: string }).version
+    : 'dev';
+}
+
+async function getUpdateSettings(c: AdminContext): Promise<{ repositoryUrl: string }> {
   const database = getDatabase(c.env);
-  const stored = await db.getSettingsByKeys(database, ['update_mode', 'update_repository_url'], true);
+  const stored = await db.getSettingsByKeys(database, ['update_repository_url'], true);
   const settings = buildAdminSettings(stored);
   return {
-    mode: settings.update_mode === 'fork' ? 'fork' : 'actions',
     repositoryUrl: settings.update_repository_url,
   };
 }
 
-async function buildReleaseUpdateResult(
+async function buildCommitUpdateResult(
   repository: string,
-  mode: 'actions' | 'fork',
   deploymentRepositoryUrl: string,
+  currentCommitRaw: string | undefined,
 ): Promise<UpdateCheckResult> {
-  const release = await fetchLatestRelease(repository);
-  const latestVersion = releaseString(release.tag_name) || 'dev';
-  const currentVersion = APP_VERSION;
+  const commit = await fetchLatestCommit(repository);
+  const latestCommit = normalizeGitSha(updateString(commit.sha));
+  const latestVersion = await fetchLatestWorkerVersion(repository, latestCommit);
+  const currentCommit = normalizeGitSha(currentCommitRaw);
   const repositoryUrl = repositoryUrlFromRepositoryUrl(deploymentRepositoryUrl);
-  const actionsUrl = workflowUrlFromRepositoryUrl(repositoryUrl || undefined);
-  const upgradeUrl = mode === 'fork' ? repositoryUrl : actionsUrl;
+  const message = updateString(commit.commit?.message);
   return {
-    current_version: currentVersion.startsWith('v') ? currentVersion : `v${currentVersion}`,
-    latest_version: latestVersion.startsWith('v') ? latestVersion : `v${latestVersion}`,
-    has_update: compareVersions(latestVersion, currentVersion) > 0,
-    release_url: releaseString(release.html_url),
-    upgrade_url: upgradeUrl,
-    actions_url: actionsUrl,
-    workflow_configured: Boolean(upgradeUrl),
-    update_mode: mode,
+    current_version: formatAppVersion(APP_VERSION),
+    latest_version: formatAppVersion(latestVersion),
+    current_commit: shortGitSha(currentCommit),
+    latest_commit: shortGitSha(latestCommit),
+    has_update: Boolean(latestCommit) && currentCommit !== latestCommit,
+    source_url: updateString(commit.html_url) || `https://github.com/${repository}/commits/${OFFICIAL_UPDATE_BRANCH}`,
+    upgrade_url: repositoryUrl,
     repository_url: repositoryUrl,
-    title: releaseString(release.name) || latestVersion,
-    body: releaseString(release.body),
-    published_at: releaseString(release.published_at),
+    title: message.split('\n')[0] || latestCommit,
+    body: message,
+    published_at: updateString(commit.commit?.committer?.date) || updateString(commit.commit?.author?.date),
   };
 }
 
@@ -1332,15 +1340,16 @@ async function buildReleaseUpdateResult(
 adminRoutes.get('/update-check', async (c) => {
   const now = Date.now();
   try {
-    const { mode, repositoryUrl } = await getUpdateSettings(c);
+    const { repositoryUrl } = await getUpdateSettings(c);
     const repository = OFFICIAL_UPDATE_REPOSITORY;
-    const cacheKey = `${repository}:release:${mode}:${repositoryUrl}:${normalizeGitSha(c.env.CURRENT_GIT_COMMIT)}`;
+    const currentCommit = normalizeGitSha(c.env.CURRENT_GIT_COMMIT);
+    const cacheKey = `${repository}:${OFFICIAL_UPDATE_BRANCH}:commit:${repositoryUrl}:${currentCommit}`;
     const cached = updateCheckCache.get(cacheKey);
     if (c.req.query('refresh') !== '1' && cached && cached.expiresAt > now) {
       return c.json(cached.value);
     }
 
-    const result = await buildReleaseUpdateResult(repository, mode, repositoryUrl);
+    const result = await buildCommitUpdateResult(repository, repositoryUrl, currentCommit);
     updateCheckCache.set(cacheKey, { expiresAt: now + UPDATE_CHECK_CACHE_MS, value: result });
     return c.json(result);
   } catch (error) {

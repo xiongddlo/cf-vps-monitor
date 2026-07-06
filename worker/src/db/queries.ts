@@ -287,12 +287,12 @@ export async function listWebsiteMonitors(database: QueryDatabase, _fresh = fals
   return sba.listSupabaseWebsiteMonitors(database.env);
 }
 
-export async function listPublicWebsiteMonitors(database: QueryDatabase, checkLimit: number = 60, _fresh = false, periodHours = 24): Promise<t.PublicWebsiteMonitor[]> {
-  return sba.getSupabasePublicWebsites(database.env, periodHours, checkLimit);
+export async function listPublicWebsiteMonitors(database: QueryDatabase, checkLimit: number = 60, _fresh = false, periodHours = 24, includeHidden = false): Promise<t.PublicWebsiteMonitor[]> {
+  return sba.getSupabasePublicWebsites(database.env, periodHours, checkLimit, includeHidden);
 }
 
-export async function getPublicWebsiteMonitorById(database: QueryDatabase, id: number, checkLimit: number = 120): Promise<t.PublicWebsiteMonitor | null> {
-  return sba.getSupabasePublicWebsiteMonitorById(database.env, id, checkLimit);
+export async function getPublicWebsiteMonitorById(database: QueryDatabase, id: number, checkLimit: number = 120, includeHidden = false): Promise<t.PublicWebsiteMonitor | null> {
+  return sba.getSupabasePublicWebsiteMonitorById(database.env, id, checkLimit, includeHidden);
 }
 
 export async function createWebsiteMonitor(database: QueryDatabase, monitor: t.WebsiteMonitorInput): Promise<t.WebsiteMonitor> {
@@ -645,29 +645,6 @@ export async function listAuditLogsPaged(
 
 export async function restoreBackupData(database: QueryDatabase, backup: BackupData): Promise<void> {
   return sba.restoreSupabaseBackupData(database.env, backup);
-}
-
-export async function getDemoResetState(database: QueryDatabase): Promise<t.DemoResetState | null> {
-  return sba.getSupabaseDemoResetState(database.env);
-}
-
-export async function getDemoSnapshot(database: QueryDatabase): Promise<BackupData | null> {
-  return sba.getSupabaseDemoSnapshot(database.env);
-}
-
-export async function saveDemoSnapshot(database: QueryDatabase, snapshot: BackupData): Promise<void> {
-  return sba.saveSupabaseDemoSnapshot(database.env, snapshot);
-}
-
-export async function markDemoResetRestored(database: QueryDatabase, restoredAt: string): Promise<void> {
-  return sba.markSupabaseDemoResetRestored(database.env, restoredAt);
-}
-
-export async function resetAdminUsers(
-  database: QueryDatabase,
-  user: { uuid: string; username: string; hashedPassword: string },
-): Promise<void> {
-  return sba.resetSupabaseAdminUsers(database.env, user);
 }
 
 export async function insertAuditLog(
