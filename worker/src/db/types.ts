@@ -32,6 +32,8 @@ export interface Client {
   hidden: boolean;
   traffic_limit: number;
   traffic_limit_type: string;
+  // 每月流量重置日（1~31）。经 agent policy 下发；改它会让探针重建当期统计。
+  traffic_reset_day: number;
   sort_order?: number;
   created_at: string;
   updated_at: string;
@@ -66,7 +68,8 @@ export interface MonitorRecord {
   ram_total: number;
   swap: number;
   swap_total: number;
-  load: number;
+  // null = 本机负载不可取信（容器内 /proc/loadavg 透传宿主机），不是 0。
+  load: number | null;
   temp: number;
   disk: number;
   disk_total: number;
@@ -396,6 +399,9 @@ export interface TableRowCounts {
 }
 
 export type HistoryTableRowCounts = Omit<TableRowCounts, 'audit_logs'>;
+
+// 历史表的真实磁盘占用（含索引与 TOAST），字节。
+export type HistoryTableByteSizes = HistoryTableRowCounts & { total: number };
 
 export interface BoundedTableRowCounts {
   counts: TableRowCounts;

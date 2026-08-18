@@ -1,6 +1,15 @@
 -- Source: 20260622010000_add_worker_data_api_phase1_rpc.sql
 set local search_path = public;
 
+-- ⚠️ 本文件里「新增列」的 DDL 必须排在任何引用该列的函数定义之前。
+-- language sql 的函数体在 CREATE 时就做完整语义校验，列不存在会当场报 42703；
+-- 存量库走的正是这条路径（全新库由 1_core_schema.sql 建列，本地怎么试都不复现）。
+-- 每月流量重置日：节点级配置，经 agent policy 下发。被 cfm_admin_clients 与
+-- cfm_create_client（均为 language sql）引用，故必须留在这里，不能放进下方 DDL 块。
+alter table clients add column if not exists traffic_reset_day smallint not null default 1;
+alter table clients drop constraint if exists clients_traffic_reset_day_check;
+alter table clients add constraint clients_traffic_reset_day_check check (traffic_reset_day between 1 and 31);
+
 -- Phase 1 Worker Data API RPC. These functions are called only by the Worker
 -- with Supabase service_role; browsers still talk only to the Worker.
 
@@ -65,7 +74,7 @@ as $$
       kernel_version, gpu_name, ipv4, ipv6, region, remark, public_remark,
       mem_total, swap_total, disk_total, version, price, billing_cycle,
       auto_renewal, currency, expired_at, "group", tags, hidden,
-      traffic_limit, traffic_limit_type, sort_order, created_at, updated_at
+      traffic_limit, traffic_limit_type, traffic_reset_day, sort_order, created_at, updated_at
     from clients
     order by sort_order asc, lower(name) asc, created_at asc
   ) row_data;
@@ -253,14 +262,19 @@ returns jsonb
 language sql
 set search_path = public
 as $$
-  insert into clients (uuid, token, token_hash, token_rotated_at, name, sort_order)
+  insert into clients (
+    uuid, token, token_hash, token_rotated_at, name, sort_order,
+    traffic_limit_type, traffic_reset_day
+  )
   values (
     coalesce(nullif(input_client->>'uuid', ''), gen_random_uuid()::text),
     input_client->>'token',
     input_client->>'token_hash',
     now(),
     coalesce(input_client->>'name', ''),
-    coalesce((input_client->>'sort_order')::integer, (select coalesce(max(sort_order), 0) + 1 from clients))
+    coalesce((input_client->>'sort_order')::integer, (select coalesce(max(sort_order), 0) + 1 from clients)),
+    coalesce(nullif(input_client->>'traffic_limit_type', ''), 'sum'),
+    least(greatest(coalesce((input_client->>'traffic_reset_day')::smallint, 1), 1), 31)
   )
   returning to_jsonb(clients);
 $$;
@@ -359,7 +373,10 @@ begin
     tags = case when input_patch ? 'tags' then coalesce(input_patch->>'tags', '') else tags end,
     hidden = case when input_patch ? 'hidden' then case when lower(coalesce(input_patch->>'hidden', '')) in ('true', '1') then 1 else 0 end else hidden end,
     traffic_limit = case when input_patch ? 'traffic_limit' then coalesce((input_patch->>'traffic_limit')::bigint, 0) else traffic_limit end,
-    traffic_limit_type = case when input_patch ? 'traffic_limit_type' then coalesce(input_patch->>'traffic_limit_type', 'max') else traffic_limit_type end,
+    traffic_limit_type = case when input_patch ? 'traffic_limit_type' then coalesce(input_patch->>'traffic_limit_type', 'sum') else traffic_limit_type end,
+    traffic_reset_day = case when input_patch ? 'traffic_reset_day'
+      then least(greatest(coalesce((input_patch->>'traffic_reset_day')::smallint, 1), 1), 31)
+      else traffic_reset_day end,
     sort_order = case when input_patch ? 'sort_order' then coalesce((input_patch->>'sort_order')::integer, 0) else sort_order end,
     updated_at = now()
   where uuid = input_uuid
@@ -1017,7 +1034,8 @@ as $$
     select distinct on (client)
       client,
       case when lower(coalesce(item->>'enable', 'false')) in ('true', '1') then 1 else 0 end as enable,
-      coalesce(nullif(item->>'grace_period', '')::integer, 180) as grace_period,
+      -- 与前端 DEFAULT_GRACE_PERIOD_SEC 及列默认值一致（360）。
+      coalesce(nullif(item->>'grace_period', '')::integer, 360) as grace_period,
       ord
     from jsonb_array_elements(coalesce(input_items, '[]'::jsonb)) with ordinality as value(item, ord)
     cross join lateral (select trim(item->>'client') as client) normalized
@@ -1358,7 +1376,7 @@ as $$
       records.client,
       case
         when input_metric = 'ram' then case when ram_total > 0 then (ram::double precision / ram_total) * 100 else 0 end
-        when input_metric = 'load' then coalesce(load, 0)
+        when input_metric = 'load' then load
         when input_metric = 'disk' then case when disk_total > 0 then (disk::double precision / disk_total) * 100 else 0 end
         when input_metric = 'temp' then coalesce(temp, 0)
         else coalesce(cpu, 0)
@@ -1367,6 +1385,9 @@ as $$
     join ids on ids.client = records.client
     where records.time >= input_start::timestamptz
       and records.time <= input_end::timestamptz
+      -- 负载不可用的采样点直接排除：既不计入 samples，也不拉低均值。
+      -- 若当成 0 参与统计，节点看起来「一直不超阈值」，与「没有数据」是两回事。
+      and (input_metric <> 'load' or records.load is not null)
   )
   select coalesce(jsonb_agg(to_jsonb(row_data) order by client), '[]'::jsonb)
   from (
@@ -1439,6 +1460,23 @@ begin
   );
 end;
 $$;
+
+-- 每月流量重置日的建列 DDL 已提到文件顶部（被 language sql 的函数体引用，必须更早执行）。
+-- 以下两个默认值此前靠应用层补丁绕开迁移，本批一并正规化（只影响新建行，存量配置不动）。
+alter table clients alter column traffic_limit_type set default 'sum';
+alter table offline_notifications alter column grace_period set default 360;
+
+-- 负载「不可用」用 null 表示：lxcfs 未虚拟化 loadavg 的容器读到的是宿主机负载，
+-- 报 0 会被读成空闲。存量库的 records.load 建成了 not null default 0，这里幂等放开。
+alter table records alter column load drop not null;
+alter table records alter column load drop default;
+
+-- 行数熔断降级为次要边界后，旧默认值 450000 会先于 400 MiB 的字节熔断跳闸，
+-- 使「按真实字节量熔断」的改造失效。把仍停留在旧默认值的库抬到 700000。
+-- 只动 450000 这个确切值：用户手工调过的阈值是有意为之，不能覆盖。
+-- （1_core_schema.sql 的 seed 是 on conflict do nothing，只对全新库生效，够不到存量库。）
+update settings set value = '700000'
+where key = 'record_high_watermark_rows' and value = '450000';
 
 alter table website_monitors add column if not exists agent_probe_mode text not null default 'off';
 alter table website_monitors add column if not exists agent_probe_clients jsonb not null default '[]'::jsonb;
@@ -1661,7 +1699,14 @@ begin
     coalesce((input_record->>'ram_total')::double precision, 0),
     coalesce((input_record->>'swap')::double precision, 0),
     coalesce((input_record->>'swap_total')::double precision, 0),
-    coalesce((input_record->>'load')::double precision, 0),
+    -- load 是唯一允许「不可用」的指标，必须区分「显式 null」与「字段缺失」：
+    -- 显式 null（容器内 loadavg 透传宿主机）落库为 null；老探针不带该字段仍按 0。
+    -- 这里若照抄其它字段的 coalesce(..., 0)，null 会在写入时被悄悄补成 0，
+    -- 可空列、告警 RPC 的 is not null 过滤、前端解析就全都读不到「不可用」。
+    case
+      when jsonb_typeof(input_record->'load') = 'null' then null
+      else coalesce((input_record->>'load')::double precision, 0)
+    end,
     coalesce((input_record->>'temp')::double precision, 0),
     coalesce((input_record->>'disk')::double precision, 0),
     coalesce((input_record->>'disk_total')::double precision, 0),
@@ -1894,14 +1939,19 @@ begin
       from numbered, params
       where not ((select count(*) from raw_rows) > params.limit_value and rn = 1)
     )
+  -- jsonb_strip_nulls 只能作用在标量字段上：它是**递归**的，套在整个响应外面会连
+  -- data 数组里 load 为 null 的键一起删掉，而前端把「键不存在」当作 0，
+  -- 「负载不可用」就被读成「空闲」。先剥标量字段的 null，再合并未经剥离的 data。
+  -- （gpu / ping 的同款游标 RPC 没有可空列，那两处保持原样。）
   select jsonb_strip_nulls(jsonb_build_object(
-    'data', coalesce((select jsonb_agg(to_jsonb(data_rows) order by time asc) from data_rows), '[]'::jsonb),
     'total', (select count(*) from data_rows) + case when (select count(*) from raw_rows) > params.limit_value then 1 else 0 end,
     'page', 1,
     'limit', params.limit_value,
     'has_more', (select count(*) from raw_rows) > params.limit_value,
     'next_cursor', case when (select count(*) from raw_rows) > params.limit_value then (select min(time) from data_rows) else null end
-  ))
+  )) || jsonb_build_object(
+    'data', coalesce((select jsonb_agg(to_jsonb(data_rows) order by time asc) from data_rows), '[]'::jsonb)
+  )
   from params
   );
 end;
@@ -2296,6 +2346,29 @@ as $$
     'gpu_snapshots', (select count(*) from gpu_snapshots),
     'ping_records', (select count(*) from ping_records),
     'ping_snapshots', (select count(*) from ping_snapshots)
+  );
+$$;
+
+-- 历史表的真实磁盘占用（含索引与 TOAST）。
+-- 熔断必须按字节量：Supabase 卡的是磁盘字节，而同样行数可能对应 72MB 也可能 189MB，
+-- 数行数还完全不含索引开销，熔断点落不到真正快满的地方。
+create or replace function public.cfm_history_storage_bytes()
+returns jsonb
+language sql
+stable
+set search_path = public
+as $$
+  select jsonb_build_object(
+    'records', pg_total_relation_size('public.records'),
+    'gpu_records', pg_total_relation_size('public.gpu_records'),
+    'gpu_snapshots', pg_total_relation_size('public.gpu_snapshots'),
+    'ping_records', pg_total_relation_size('public.ping_records'),
+    'ping_snapshots', pg_total_relation_size('public.ping_snapshots'),
+    'total', pg_total_relation_size('public.records')
+      + pg_total_relation_size('public.gpu_records')
+      + pg_total_relation_size('public.gpu_snapshots')
+      + pg_total_relation_size('public.ping_records')
+      + pg_total_relation_size('public.ping_snapshots')
   );
 $$;
 
@@ -3215,6 +3288,10 @@ revoke all on function public.cfm_ping_records_for_tasks(text, jsonb, integer, t
 revoke all on function public.cfm_ping_records_for_tasks(text, jsonb, integer, text) from authenticated;
 grant execute on function public.cfm_ping_records_for_tasks(text, jsonb, integer, text) to service_role;
 
+revoke all on function public.cfm_history_storage_bytes() from public;
+revoke all on function public.cfm_history_storage_bytes() from anon;
+revoke all on function public.cfm_history_storage_bytes() from authenticated;
+grant execute on function public.cfm_history_storage_bytes() to service_role;
 revoke all on function public.cfm_history_storage_counts() from public;
 revoke all on function public.cfm_history_storage_counts() from anon;
 revoke all on function public.cfm_history_storage_counts() from authenticated;
@@ -3592,7 +3669,7 @@ begin
         name, cpu_name, virtualization, arch, cpu_cores, os, kernel_version, gpu_name,
         ipv4, ipv6, region, remark, public_remark, mem_total, swap_total, disk_total,
         version, price, billing_cycle, auto_renewal, currency, expired_at, "group", tags,
-        hidden, traffic_limit, traffic_limit_type, sort_order, created_at, updated_at
+        hidden, traffic_limit, traffic_limit_type, traffic_reset_day, sort_order, created_at, updated_at
       )
       values (
         item->>'uuid',
@@ -3627,7 +3704,11 @@ begin
         coalesce(item->>'tags', ''),
         case when coalesce((item->>'hidden')::boolean, false) then 1 else 0 end,
         coalesce((item->>'traffic_limit')::bigint, 0),
-        coalesce(item->>'traffic_limit_type', 'max'),
+        -- 兜底值与 cfm_create_client / cfm_update_client 保持一致（'sum'）；
+        -- 还原路径漏改会让从旧备份恢复的节点静默回到 'max' 口径。
+        coalesce(nullif(item->>'traffic_limit_type', ''), 'sum'),
+        -- 缺省补 1 并钳到 1~31：列上有 check 约束，直接写 0 会让整个还原事务失败。
+        least(greatest(coalesce((item->>'traffic_reset_day')::smallint, 1), 1), 31),
         coalesce((item->>'sort_order')::integer, 0),
         coalesce(nullif(item->>'created_at', '')::timestamptz, now()),
         coalesce(nullif(item->>'updated_at', '')::timestamptz, now())
@@ -3665,6 +3746,7 @@ begin
         hidden = excluded.hidden,
         traffic_limit = excluded.traffic_limit,
         traffic_limit_type = excluded.traffic_limit_type,
+        traffic_reset_day = excluded.traffic_reset_day,
         sort_order = excluded.sort_order,
         updated_at = now();
     end loop;
@@ -4884,7 +4966,8 @@ as $$
     select distinct on (client)
       client,
       case when lower(coalesce(item->>'enable', 'false')) in ('true', '1') then 1 else 0 end as enable,
-      coalesce(nullif(item->>'grace_period', '')::integer, 180) as grace_period,
+      -- 与前端 DEFAULT_GRACE_PERIOD_SEC 及列默认值一致（360）。
+      coalesce(nullif(item->>'grace_period', '')::integer, 360) as grace_period,
       ord
     from jsonb_array_elements(coalesce(input_items, '[]'::jsonb)) with ordinality as value(item, ord)
     cross join lateral (select trim(item->>'client') as client) normalized

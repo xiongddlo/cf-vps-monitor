@@ -86,12 +86,6 @@ const ADMIN_CLIENTS_CACHE_MS = 5_000;
 const ADMIN_PING_TASKS_CACHE_MS = 5_000;
 const ADMIN_PING_TASKS_EDGE_CACHE_SECONDS = 15;
 const ADMIN_SETTINGS_SCOPE_CACHE_MS = 10_000;
-/**
- * 新建节点默认的流量统计口径。
- * 数据库列默认值仍是 'max'，改迁移会迫使存量用户重新初始化数据库，
- * 因此在写入侧显式指定，只影响新建节点，存量节点不受影响。
- */
-const DEFAULT_TRAFFIC_LIMIT_TYPE = 'sum';
 const HEALTH_CACHE_MS = 30_000;
 const ALLOWED_CLIENT_IDS_CACHE_MS = 30_000;
 const OFFICIAL_UPDATE_REPOSITORY = 'kadidalax/cf-vps-monitor';
@@ -108,6 +102,7 @@ const RECORD_PERSISTENCE_SETTING_KEYS = new Set([
   'record_persist_interval_sec',
   'ping_record_persist_interval_sec',
   'record_high_watermark_rows',
+  'record_high_watermark_bytes',
 ]);
 const CAPACITY_ESTIMATE_SETTING_KEYS = [
   'record_enabled',
@@ -118,6 +113,7 @@ const CAPACITY_ESTIMATE_SETTING_KEYS = [
   'record_persist_interval_sec',
   'ping_record_persist_interval_sec',
   'record_high_watermark_rows',
+  'record_high_watermark_bytes',
   'audit_log_preserve_time',
   'capacity_daily_view_minutes',
 ];
@@ -141,6 +137,7 @@ const SETTINGS_SCOPE_KEYS = {
     'record_persist_interval_sec',
     'ping_record_persist_interval_sec',
     'record_high_watermark_rows',
+    'record_high_watermark_bytes',
     'capacity_daily_view_minutes',
     'offline_confirm_rounds',
   ],
@@ -1123,10 +1120,16 @@ export async function buildCapacityEstimate(database: db.QueryDatabase, options:
     };
   }
 
-  const [clientCapacityCounts, rawSettings, pingTasks] = await Promise.all([
+  const [clientCapacityCounts, rawSettings, pingTasks, historyByteSizes] = await Promise.all([
     db.countClientCapacityTargets(database),
     db.getSettingsByKeys(database, CAPACITY_ESTIMATE_SETTING_KEYS),
     db.listPingTaskEstimateRows(database),
+    // 历史表真实占用：主熔断线的量纲，必须随每次估算一起下发。
+    // 刻意**不**放进 getCapacityRowCounts——那份快照被 refresh_counts 挡着，
+    // 只有管理员点「刷新实际行数」才取；跟着它走会让首屏的容量进度条恒为空，
+    // 而字节数是 pg_total_relation_size 读元数据，和 count(*) 的全表扫描不是一个量级，
+    // 本来就不需要被那道闸门挡住。整份估算已有 30 秒缓存，这里最多每 30 秒一次 RPC。
+    db.getHistoryStorageBytes(database).catch(() => null),
   ]);
   const clientCount = clientCapacityCounts.clients;
   const gpuClientCount = clientCapacityCounts.gpu_clients;
@@ -1141,7 +1144,10 @@ export async function buildCapacityEstimate(database: db.QueryDatabase, options:
     MAX_UNIFIED_PING_INTERVAL_SEC,
     Math.max(MIN_UNIFIED_PING_INTERVAL_SEC, parsePositiveNumber(settings.ping_record_persist_interval_sec, DEFAULT_UNIFIED_PING_INTERVAL_SEC)),
   );
-  const highWatermarkRows = Math.min(10_000_000, Math.max(1_000, parsePositiveNumber(settings.record_high_watermark_rows, 450_000)));
+  const highWatermarkRows = Math.min(10_000_000, Math.max(1_000, parsePositiveNumber(settings.record_high_watermark_rows, 700_000)));
+  // 字节熔断线：与 DO 侧 RECORD_HIGH_WATERMARK_{MIN,MAX}_BYTES 用同一组边界，
+  // 面板显示的阈值必须等于真正生效的那个值，否则用户照着面板调也调不到点上。
+  const highWatermarkBytes = Math.min(549_755_813_888, Math.max(16_777_216, parsePositiveNumber(settings.record_high_watermark_bytes, 419_430_400)));
   const auditPreserveHours = Math.max(24, parsePositiveNumber(settings.audit_log_preserve_time, 2160));
   const effectiveActiveIntervalSec = Math.max(sampleIntervalSec, persistIntervalSec);
   const effectiveIdleIntervalSec = Math.max(idleIntervalSec, persistIntervalSec);
@@ -1232,6 +1238,7 @@ export async function buildCapacityEstimate(database: db.QueryDatabase, options:
     record_persist_interval_sec: persistIntervalSec,
     ping_record_persist_interval_sec: unifiedPingIntervalSec,
     record_high_watermark_rows: highWatermarkRows,
+    record_high_watermark_bytes: highWatermarkBytes,
     capacity_daily_view_minutes: dailyViewMinutes,
     active_seconds_per_day: activeSecondsPerDay,
     idle_seconds_per_day: idleSecondsPerDay,
@@ -1270,6 +1277,11 @@ export async function buildCapacityEstimate(database: db.QueryDatabase, options:
     row_counts_capped: rowCounts?.bounded_row_counts?.capped ?? null,
     row_counts_limit: rowCounts?.bounded_row_counts?.limit ?? null,
     expired_row_counts: rowCounts?.expired_row_counts ?? null,
+    // 历史表真实占用：这是主熔断线的量纲，必须和 record_high_watermark_bytes 一起下发，
+    // 否则后台只有一个可填的上限、没有对应的当前值，用户无从判断离跳闸还有多远。
+    // 与 rowCounts 无关，首屏即有值。
+    history_byte_sizes: historyByteSizes ?? null,
+    history_total_bytes: historyByteSizes?.total ?? null,
     row_counts_checked_at: rowCounts?.checked_at ?? null,
     row_counts_cache_seconds: rowCounts ? CAPACITY_ROW_COUNT_CACHE_MS / 1000 : 0,
     row_counts_cache_key: rowCounts?.cache_key ?? null,
@@ -1501,21 +1513,6 @@ adminRoutes.post('/clients/add', async (c) => {
     } catch (error) {
       if (isClientUniqueConflict(error)) return c.json({ error: '客户端 UUID 或 Token 已存在' }, 409);
       throw error;
-    }
-    // 新建节点的流量统计口径默认「总计」。必须在建完之后单独写一次：
-    // RPC cfm_create_client 的 insert 列是写死的（uuid/token/token_hash/
-    // token_rotated_at/name/sort_order），传再多字段也不会进库，
-    // 于是该列只会取数据库默认值，而那个默认值仍是 'max'。
-    // 改迁移能一步到位，但会迫使所有存量用户重新初始化数据库，代价不成比例。
-    // 失败不影响建节点本身，用户仍可在编辑里改。
-    try {
-      const updated = await timed(metrics, 'db_default_traffic_type', () =>
-        db.updateClientAndReturn(database, createdClient.uuid, {
-          traffic_limit_type: DEFAULT_TRAFFIC_LIMIT_TYPE,
-        }));
-      if (updated) createdClient = updated;
-    } catch {
-      // 忽略：节点已创建成功，默认口径没落上不算失败
     }
     const safeClient = hideAdminClientToken(createdClient);
     invalidateAdminClientsCache();
