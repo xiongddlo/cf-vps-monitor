@@ -55,17 +55,18 @@ test('AUD-13 frontend history budget uses live data estimate instead of allocate
 test('AUD-15 frontend estimates include separate DO writes and unknown resource dimensions', () => {
   const derived = derivedCapacity(capacityInput());
   const writes = derived.resourceEstimates?.find(row => row.key === 'durable_object_rows_written');
-  assert.equal(writes?.websocket, 108000, '50 nodes and two 120-second Ping tasks exceed the 100000 daily DO write allowance');
+  // 36000 final snapshots + 36000 history markers + 72000 Ping task states.
+  assert.equal(writes?.websocket, 144000, '50 nodes and two 120-second Ping tasks exceed the 100000 daily DO write allowance');
   assert.equal(writes.within_free_websocket, false);
   for (const key of ['durable_object_rows_read', 'durable_object_duration_gb_seconds', 'supabase_egress_bytes']) {
     assert.equal(derived.resourceEstimates.find(row => row.key === key).websocket, null, key + ' cannot be silently treated as zero');
   }
 });
 
-test('AUD-15 disabling history in the local preview removes Ping state writes but retains HTTP live writes', () => {
+test('AUD-15 disabling history in the local preview retains final snapshot writes in both transports', () => {
   const derived = derivedCapacity(capacityInput(), { ...capacitySettings, record_enabled: 'false' });
   const writes = derived.resourceEstimates.find(row => row.key === 'durable_object_rows_written');
-  assert.equal(writes.websocket, 0, 'disabled Ping history does not write any task persistence state');
+  assert.equal(writes.websocket, 36000, 'WebSocket final snapshots persist each monitor report even without Ping history');
   assert.equal(writes.http, 36000, 'HTTP live state still persists each monitor report without history');
   assert.equal(writes.within_free_websocket, true);
   assert.equal(writes.within_free_http, true);
@@ -513,6 +514,7 @@ test('AUD-42 LiveDataProvider keeps newer live/settings when an earlier bootstra
     const settingsModule = productionModule('src/utils/publicSettings.ts');
     let current;
     let title;
+    let clientMetadata;
     let refresh;
     let fallbackCalls = 0;
     const effect = productionEffect('src/contexts/LiveDataContext.tsx', 'const applyBootstrap', {
@@ -524,6 +526,8 @@ test('AUD-42 LiveDataProvider keeps newer live/settings when an earlier bootstra
       normalizeLivePollConfig: () => ({}), pollConfigRef: { current: {} }, DEFAULT_LIVE_POLL_CONFIG: {},
       normalizeLiveDataResponse, rememberInitialLiveMetadataVersion() {}, setLoading() {}, setError() {},
       setLiveData: value => { current = value; },
+      setClientMetadata: update => { clientMetadata = typeof update === 'function' ? update(clientMetadata) : update; },
+      mergePublicClientPatch: productionModule('src/utils/publicClients.ts').mergePublicClientPatch,
       fetchPublicBootstrap: (...args) => { const pending = bootstrap.fetchPublicBootstrap(...args); promises.push(pending); return pending; },
       fetchPublicSettings: () => { fallbackCalls += 1; return Promise.reject(new Error('Unexpected obsolete settings fallback')); },
       subscribePublicDataUpdated: callback => { refresh = callback; return () => {}; },
@@ -546,6 +550,7 @@ test('AUD-42 LiveDataProvider keeps newer live/settings when an earlier bootstra
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(bootstrap.getCachedPublicBootstrap().clients[0].name, 'new B', 'cache control');
       assert.deepEqual([current.clients[0].name, title], ['new B', 'new B'], 'live state and settings must belong to the latest request');
+      assert.equal(clientMetadata[0].name, 'new B', 'the retained metadata list also belongs to the latest request');
       assert.equal(fallbackCalls, 0, 'an obsolete response must not refresh settings again');
     } finally { cleanup(); }
     });
