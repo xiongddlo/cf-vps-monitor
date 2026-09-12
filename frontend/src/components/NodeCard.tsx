@@ -106,10 +106,12 @@ function RingMetric({
   label,
   percent,
   estimated = false,
+  title,
 }: {
   label: string;
   percent: number | null;
   estimated?: boolean;
+  title?: string;
 }) {
   const clamped = clampPercent(percent ?? 0);
   const ringStyle = {
@@ -121,6 +123,7 @@ function RingMetric({
       className="node-resource-ring"
       data-monitor-role="resource-ring"
       data-load={percent === null ? undefined : getUsageLevel(clamped)}
+      title={title}
     >
       <div className="node-resource-ring-chart" style={ringStyle}>
         <Text className="node-resource-ring-value" weight="bold">
@@ -301,7 +304,7 @@ export default function NodeCard({ client, live, online, status, lastReportTime,
                 chartWidth={460}
                 chartHeight={260}
                 limit={360}
-                rangeHours={1}
+                rangeHours={4}
                 includeHidden={includeHidden}
                 trigger={
                   <IconButton className="node-card-action" data-node-card-action="true" variant="ghost" size="2" aria-label="查看 Ping 延迟" title="查看 Ping 延迟走势">
@@ -314,7 +317,7 @@ export default function NodeCard({ client, live, online, status, lastReportTime,
               </Badge>
             </Flex>
           </Flex>
-          {nodeStatus === 'offline' && <Text size="1" color="gray">最后上报 {formatLastReport(lastReportTime)} · {live ? '显示最后状态' : '暂无上报数据'}</Text>}
+          {nodeStatus === 'offline' && <Text size="1" color="gray">最后上报 {formatLastReport(lastReportTime)}{!live && ' · 暂无上报数据'}</Text>}
           <Flex className="node-card-title-meta" align="center" gap="2">
             <span className="node-os-chip">
               <img src={osConfig.image} alt="" aria-hidden="true" />
@@ -382,7 +385,7 @@ export default function NodeCard({ client, live, online, status, lastReportTime,
               <div className="node-resource-ring-grid">
                 <RingMetric label="CPU" percent={cpuPct} />
                 <RingMetric label="RAM" percent={memPct} />
-                <RingMetric label={disk.estimated ? 'Disk（估算）' : 'Disk'} percent={diskPct} estimated={disk.estimated} />
+                <RingMetric label={disk.estimated ? 'Disk（估算）' : 'Disk'} percent={diskPct} estimated={disk.estimated} title={disk.estimated ? `${disk.description} ${disk.detail} ${disk.sampleLabel}` : undefined} />
               </div>
 
               <NetworkSummary
@@ -394,7 +397,6 @@ export default function NodeCard({ client, live, online, status, lastReportTime,
                 historical={nodeStatus === 'offline'}
               />
             </div>
-            {disk.estimated && <Text as="p" size="1" color="gray" title={disk.description} className="node-disk-estimate">文件占用估算 · {disk.detail} · {disk.sampleLabel}</Text>}
           </Flex>
         </Flex>
       </Link>
