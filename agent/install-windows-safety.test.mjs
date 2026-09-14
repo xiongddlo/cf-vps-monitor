@@ -212,9 +212,29 @@ test('AUD-25 a start failure restores the old executable and task', { skip: !win
 
 test('AUD-54 the generated runner preserves Unicode quotes and backslashes in the actual child environment', { skip: !windows }, t => {
   const result = upgradeFixture(t, false, true);
-  t.diagnostic(JSON.stringify(result));
   assert.equal(result.failed, false, result.error);
   assert.equal(result.name, "上海'节点\\A");
   assert.equal(result.nicInclude, "网卡\\eth'");
   assert.equal(result.mountInclude, "C:\\数据,D:\\x'x");
 });
+
+for (const [scenario, failureCategory] of [
+  ['running', null],
+  ['exited-after-enumeration', null],
+  ['stop-denied', 'PermissionDenied'],
+  ['stop-failed', 'InvalidOperation'],
+]) {
+  test(`CI02 native process stop handles ${scenario}`, { skip: !windows }, () => {
+    const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-File',
+      fileURLToPath(new URL('./testdata/windows-process-stop.ps1', import.meta.url)),
+      '-Installer', installer, '-Scenario', scenario], {
+      encoding: 'utf8', timeout: 15_000, windowsHide: true,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    const outcome = JSON.parse(result.stdout.trim());
+    assert.equal(outcome.stopped, failureCategory === null, JSON.stringify(outcome));
+    assert.equal(outcome.exited, failureCategory === null, 'a stop failure must leave the child running');
+    assert.equal(outcome.failureCategory, failureCategory);
+  });
+}

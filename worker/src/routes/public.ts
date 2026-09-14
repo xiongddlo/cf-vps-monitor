@@ -10,10 +10,11 @@ import { getDatabase } from '../db/provider';
 import { resolveSupabaseApiKey } from '../db/supabase-api/client';
 import { invalidateAdminSessionCache, validateAdminSession } from '../auth/admin-session';
 import { AuthConfigurationError, generateToken, verifyAdminToken } from '../auth/jwt';
-import { decryptTotpSecret, hashRecoveryCode } from '../auth/mfa';
+import { MfaConfigurationError } from '../auth/mfa';
+import { confirmUserMfaFactor } from '../auth/mfa-factor';
 import { generateMfaToken, verifyMfaToken } from '../auth/mfa-token';
-import { verifyTotpCode } from '../auth/totp';
-import { hashPassword, needsPasswordRehash, validateAdminPasswordStrength, verifyPassword } from '../auth/password';
+import { needsPasswordRehash, validateAdminPasswordStrength } from '../auth/password';
+import { hashAdminPassword, verifyAdminPassword } from '../auth/password-service';
 import {
   clearAdminSessionCookie,
   ensureAdminCsrfCookie,
@@ -60,7 +61,7 @@ const PUBLIC_HISTORY_CACHE_MAX_ENTRIES = 256;
 const PUBLIC_METADATA_CACHE_MAX_ENTRIES = PUBLIC_HISTORY_CACHE_MAX_ENTRIES;
 const ADMIN_SESSION_EDGE_CACHE_SECONDS = 30;
 const LOGOUT_CLEAR_SITE_DATA_HEADER = '"cache"';
-const DUMMY_ADMIN_PASSWORD_HASH = 'pbkdf2_sha256$10000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+const DUMMY_ADMIN_PASSWORD_HASH = 'pbkdf2_sha256$100000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
 const MAX_ADMIN_RECOVERY_KEY_LENGTH = 8192;
 const MAX_ADMIN_RECOVERY_USERNAME_BYTES = 64;
 const SITE_LOGO_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
@@ -393,9 +394,15 @@ function readIntParam(value: string | undefined, fallback: number, max: number):
   return Math.min(parsed, max);
 }
 
-function readTimeCursorParam(value: string | undefined): { cursor?: string; error?: string } {
+function readTimeCursorParam(value: string | undefined, allowCompound = false): { cursor?: string; error?: string } {
   const text = (value || '').trim();
   if (!text) return {};
+  if (allowCompound && text.startsWith('v1|')) {
+    const parts = text.length <= 128 && /^v1\|(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2}))\|([1-9]\d{0,18})\|(0|[1-9]\d{0,9})$/.exec(text);
+    if (!parts || !Number.isFinite(Date.parse(parts[1])) || BigInt(parts[2]) > 9223372036854775807n ||
+      BigInt(parts[3]) > 2147483647n) return { error: 'cursor 参数无效' };
+    return { cursor: text };
+  }
   const time = Date.parse(text);
   if (!Number.isFinite(time)) return { error: 'cursor 参数无效' };
   return { cursor: new Date(time).toISOString() };
@@ -537,6 +544,9 @@ function applyPublicClientsOverlay(clients: PublicClient[], overlay: AdminClient
     const client = toPublicClient(raw as Parameters<typeof toPublicClient>[0]);
     if (!client.uuid || removed.has(client.uuid)) continue;
     const existing = byUuid.get(client.uuid);
+    // A full database list owns membership. Overlay state can be stale after a
+    // delete whose durable synchronization is still queued.
+    if (!existing) continue;
     const existingUpdatedAt = Date.parse(existing?.updated_at || '');
     const overlayUpdatedAt = Date.parse(client.updated_at || '');
     if (Number.isFinite(existingUpdatedAt)
@@ -993,6 +1003,7 @@ publicRoutes.post('/admin/recovery', async (c) => {
   const serviceRoleKey = readRecoverySecretKey(parsed.body);
   const username = readRecoveryUsername(parsed.body);
   const password = readRecoveryPassword(parsed.body);
+  if (password.length > MAX_LOGIN_PASSWORD_LENGTH) return c.json({ error: '密码长度超出限制' }, 400);
 
   const usernameError = validateRecoveryUsername(username);
   if (usernameError) return c.json({ error: usernameError }, 400);
@@ -1016,7 +1027,7 @@ publicRoutes.post('/admin/recovery', async (c) => {
   const candidate = {
     uuid: crypto.randomUUID(),
     username,
-    hashedPassword: await hashPassword(password),
+    hashedPassword: await hashAdminPassword(c.env, username, password),
   };
   let user: Pick<db.User, 'uuid' | 'username' | 'session_version'>;
   if (userCount === 0) {
@@ -1086,7 +1097,7 @@ publicRoutes.post('/login', async (c) => {
   const user = await timed(metrics, 'db_user', () => db.getUserByUsername(database, username));
   if (!user) {
     const userCount = await timed(metrics, 'db_user_count', () => db.countUsers(database));
-    await timed(metrics, 'verify_password', () => verifyPassword(password, DUMMY_ADMIN_PASSWORD_HASH));
+    await timed(metrics, 'verify_password', () => verifyAdminPassword(c.env, username, password, DUMMY_ADMIN_PASSWORD_HASH));
     const failedAt = Date.now();
     await timed(metrics, 'db_record_failure', () => recordLoginFailure(database, rateLimitBuckets, failedAt, rateLimitStates));
     await timed(metrics, 'audit_failure', () => auditLoginFailure(database, username, clientIp, 'unknown_user', failedAt));
@@ -1097,7 +1108,7 @@ publicRoutes.post('/login', async (c) => {
     return c.json({ error: '用户名或密码错误' }, 401);
   }
 
-  const valid = await timed(metrics, 'verify_password', () => verifyPassword(password, user.passwd));
+  const valid = await timed(metrics, 'verify_password', () => verifyAdminPassword(c.env, user.uuid, password, user.passwd));
   if (!valid) {
     const failedAt = Date.now();
     await timed(metrics, 'db_record_failure', () => recordLoginFailure(database, rateLimitBuckets, failedAt, rateLimitStates));
@@ -1109,7 +1120,7 @@ publicRoutes.post('/login', async (c) => {
   if (needsPasswordRehash(user.passwd)) {
     runLoginBackground(
       c,
-      hashPassword(password).then((hashedPassword) => db.updateUserPassword(database, user.uuid, hashedPassword)),
+      hashAdminPassword(c.env, user.uuid, password).then((hashedPassword) => db.rehashUserPassword(database, user.uuid, user.passwd, hashedPassword)),
     );
   }
 
@@ -1204,36 +1215,22 @@ publicRoutes.post('/login/mfa', async (c) => {
     return c.json({ code: 'MFA_RATE_LIMITED', error: `验证尝试过于频繁，请 ${retryAfter} 秒后再试` }, 429);
   }
 
-  let verified = false;
-  if (method === 'totp') {
-    try {
-      const secret = await timed(metrics, 'decrypt_totp', () => decryptTotpSecret(user.totp_secret_enc!, user.uuid, c.env));
-      const result = await timed(metrics, 'verify_totp', () => verifyTotpCode(secret, code));
-      if (result.valid && result.step !== undefined) {
-        verified = await timed(metrics, 'consume_totp_step', () => db.consumeTotpStep(database, user.uuid, result.step!));
-      }
-    } catch (error) {
-      if (error instanceof AuthConfigurationError) {
-        console.error('[auth] JWT_SECRET is missing or shorter than 32 bytes');
-        return c.json({ error: '服务端 JWT_SECRET 未正确配置' }, 500);
-      }
-      console.error('[auth] failed to decrypt TOTP secret:', sanitizeSetupDiagnosticDetail(error));
-      return c.json({ error: '双重身份验证配置损坏，请使用管理员恢复功能' }, 500);
+  let confirmation: db.MfaFactorConfirmation;
+  try {
+    confirmation = await timed(metrics, 'confirm_mfa', () => confirmUserMfaFactor(database, user, {
+      method, code, purpose: 'mfa-login', operationToken: challenge,
+    }, c.env));
+  } catch (error) {
+    if (error instanceof AuthConfigurationError) {
+      return c.json({ error: '服务端 JWT_SECRET 未正确配置' }, 500);
     }
-  } else {
-    try {
-      const codeHash = await timed(metrics, 'hash_recovery_code', () => hashRecoveryCode(code, c.env));
-      verified = await timed(metrics, 'consume_recovery_code', () => db.consumeRecoveryCode(database, user.uuid, codeHash));
-    } catch (error) {
-      if (error instanceof AuthConfigurationError) {
-        console.error('[auth] JWT_SECRET is missing or shorter than 32 bytes');
-        return c.json({ error: '服务端 JWT_SECRET 未正确配置' }, 500);
-      }
-      verified = false;
+    if (error instanceof MfaConfigurationError) {
+      return c.json({ code: 'MFA_CONFIGURATION_ERROR', error: '服务端双重验证密钥配置不可用，请检查当前及保留的加密密钥' }, 500);
     }
+    return c.json({ code: 'MFA_TEMPORARY_UNAVAILABLE', error: '暂时无法确认验证结果，请稍后使用同一验证码或恢复码重试' }, 503);
   }
 
-  if (!verified) {
+  if (!confirmation.verified) {
     const failedAt = Date.now();
     await timed(metrics, 'db_record_failure', () => recordLoginFailure(database, mfaBuckets, failedAt, rateLimitStates));
     await timed(metrics, 'audit_failure', () => auditLoginFailure(database, user.username, clientIp, 'invalid_mfa', failedAt));
@@ -1452,7 +1449,7 @@ publicRoutes.get('/records/load', async (c) => {
   if (start && end) {
     const limitQuery = c.req.query('limit');
     if (wantsPagedResponse(c)) {
-      const cursorParam = readTimeCursorParam(c.req.query('cursor'));
+      const cursorParam = readTimeCursorParam(c.req.query('cursor'), true);
       if (cursorParam.error) return c.json({ error: cursorParam.error }, 400);
       if (cursorParam.cursor) {
         const limit = readIntParam(limitQuery, 100, 500);
@@ -1509,7 +1506,7 @@ publicRoutes.get('/records/gpu', async (c) => {
   }
 
   if (wantsPagedResponse(c)) {
-    const cursorParam = readTimeCursorParam(c.req.query('cursor'));
+    const cursorParam = readTimeCursorParam(c.req.query('cursor'), true);
     if (cursorParam.error) return c.json({ error: cursorParam.error }, 400);
     if (cursorParam.cursor) {
       return publicHistoryResult(c, prepared, await db.getGPURecordsCursor(database, uuid, start, end, cursorParam.cursor, limit));
@@ -1546,7 +1543,7 @@ publicRoutes.get('/records/ping', async (c) => {
   }
 
   if (wantsPagedResponse(c)) {
-    const cursorParam = readTimeCursorParam(c.req.query('cursor'));
+    const cursorParam = readTimeCursorParam(c.req.query('cursor'), true);
     if (cursorParam.error) return c.json({ error: cursorParam.error }, 400);
     if (cursorParam.cursor) {
       return publicHistoryResult(c, prepared, await db.getPingRecordsCursor(database, uuid, taskId, cursorParam.cursor, limit));
@@ -1694,4 +1691,5 @@ publicRoutes.get('/live', async (c) => {
   return response;
 });
 
-export { publicRoutes, generateToken, hashPassword, verifyPassword };
+export { publicRoutes, generateToken };
+export { hashPassword, verifyPassword } from '../auth/password';
